@@ -53,7 +53,8 @@ type RequestVoteArgs struct {
 }
 
 type RequestVoteReply struct {
-	Term int
+	Term        int
+	VoteGranted bool
 }
 
 type AppendEntriesArgs struct {
@@ -62,7 +63,27 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term int
+	Term    int
+	Success bool
+}
+
+func NewConsensusModule(id int, peerIds []int, server *Server, ready <-chan interface{}) *ConsensusModule {
+	cm := new(ConsensusModule)
+	cm.id = id
+	cm.peerIds = peerIds
+	cm.server = server
+	cm.state = Follower
+	cm.votedFor = -1
+
+	go func() {
+		<-ready
+		cm.mu.Lock()
+		cm.electionResetEvent = time.Now()
+		cm.mu.Unlock()
+		cm.runElectionTimer()
+	}()
+
+	return cm
 }
 
 func (cm *ConsensusModule) runElectionTimer() {
@@ -114,7 +135,7 @@ func (cm *ConsensusModule) startElection() {
 
 	// Send RequestVotes RPCs to all other servers concurrently
 	for _, peerId := range cm.peerIds {
-		go func(peerid int) {
+		go func(peerId int) {
 			args := RequestVoteArgs{
 				Term:        savedCurrentTerm,
 				CandidateId: cm.id,
@@ -215,6 +236,71 @@ func (cm *ConsensusModule) electionTimeout() time.Duration {
 	} else {
 		return time.Duration(150+rand.Intn(150)) * time.Millisecond
 	}
+}
+
+func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) error {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	if cm.state == Dead {
+		return nil
+	}
+	cm.dlog("RequsetVote: %+v [currentTerm=%d, votedFor=%d]", args, cm.currentTerm, cm.votedFor)
+
+	if args.Term > cm.currentTerm {
+		cm.dlog("... term out of date in RequestVote")
+		cm.becomeFollower(args.Term)
+	}
+
+	if cm.currentTerm == args.Term && (cm.votedFor == -1 || cm.votedFor == args.CandidateId) {
+		reply.VoteGranted = true
+		cm.votedFor = args.CandidateId
+		cm.electionResetEvent = time.Now()
+	} else {
+		reply.VoteGranted = false
+	}
+	reply.Term = cm.currentTerm
+	cm.dlog("... Request vote reply: %+v", reply)
+	return nil
+}
+
+func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) error {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	if cm.state == Dead {
+		return nil
+	}
+	cm.dlog("AppendEntries: %+v", args)
+
+	if args.Term > cm.currentTerm {
+		cm.dlog("... term out of date in AppendEntries")
+		cm.becomeFollower(args.Term)
+	}
+
+	reply.Success = false
+	if args.Term == cm.currentTerm {
+		if cm.state != Follower {
+			cm.becomeFollower(args.Term)
+		}
+		cm.electionResetEvent = time.Now()
+		reply.Success = true
+	}
+
+	reply.Term = cm.currentTerm
+	cm.dlog("AppendEntries reply: %+v", *reply)
+	return nil
+}
+
+func (cm *ConsensusModule) Report() (id int, term int, isLeader bool) {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	return cm.id, cm.currentTerm, cm.state == Leader
+}
+
+func (cm *ConsensusModule) Stop() {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	cm.state = Dead
+	cm.dlog("becomes Dead")
 }
 
 // logs a dubug message if DebugCM > 0.
