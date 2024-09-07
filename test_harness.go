@@ -74,7 +74,37 @@ func NewHarness(t *testing.T, n int) *Harness {
 	return h
 }
 
+// disconnect a server from all other servers in the cluster.
+func (h *Harness) DisconnectPeer(id int) {
+	tlog("Disconnect %d", id)
+	h.cluster[id].DisconnectAll()
+	for j := 0; j < h.n; j++ {
+		if j != id {
+			h.cluster[j].DisconnectPeer(id)
+		}
+	}
+	h.connected[id] = false
+}
+
+// connects a server to all other servers in the cluster.
+func (h *Harness) ReconnectPeer(id int) {
+	tlog("Reconnect %d", id)
+	for j := 0; j < h.n; j++ {
+		if j != id {
+			if err := h.cluster[id].ConnectToPeer(j, h.cluster[j].GetListenAddr()); err != nil {
+				h.t.Fatal(err)
+			}
+			if err := h.cluster[j].ConnectToPeer(id, h.cluster[id].GetListenAddr()); err != nil {
+				h.t.Fatal(err)
+			}
+		}
+	}
+	h.connected[id] = true
+}
+
+// checks that only a single server thinks it is the leader.
 func (h *Harness) CheckSingleLeader() (int, int) {
+	// retries serveral times if no leader is identified yet.
 	for r := 0; r < 5; r++ {
 		leaderId := -1
 		leaderTerm := -1
@@ -94,11 +124,24 @@ func (h *Harness) CheckSingleLeader() (int, int) {
 		if leaderId >= 0 {
 			return leaderId, leaderTerm
 		}
+		// sleep for some time before retrying.
 		sleepMs(150)
 	}
 
 	h.t.Fatalf("leader not found")
 	return -1, -1
+}
+
+// checks that no connected server considers itself the leader.
+func (h *Harness) CheckNoLeader() {
+	for i := 0; i < h.n; i++ {
+		if h.connected[i] {
+			_, _, isLeader := h.cluster[i].cm.Report()
+			if isLeader {
+				h.t.Fatalf("server %d leader; want none", i)
+			}
+		}
+	}
 }
 
 func (h *Harness) Shutdown() {
@@ -118,6 +161,7 @@ func (h *Harness) SubmitToServer(serverId int, cmd interface{}) bool {
 	return h.cluster[serverId].cm.Submit(cmd)
 }
 
+// read commitChans of all servers and add them to corresponding commits.
 func (h *Harness) collectCommit(i int) {
 	for c := range h.commitChans[i] {
 		h.mu.Lock()
@@ -134,6 +178,8 @@ func (h *Harness) CheckCommittedN(cmd int, n int) {
 	}
 }
 
+// verifies that connected servers have cmd committed with the same index.
+// it also verifies that all commands before cmd in the commit sequence match.
 func (h *Harness) CheckCommitted(cmd int) (nc int, index int) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -167,6 +213,7 @@ func (h *Harness) CheckCommitted(cmd int) (nc int, index int) {
 				}
 			}
 		}
+		// found cmd in commit sequence.
 		if cmdAtC == cmd {
 			// check consistency of index
 			index := -1

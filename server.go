@@ -58,6 +58,7 @@ func (s *Server) Serve() {
 
 	s.wg.Add(1)
 
+	// listen for connection.
 	go func() {
 		defer s.wg.Done()
 
@@ -89,6 +90,18 @@ func (s *Server) ConnectToPeer(peerId int, addr net.Addr) error {
 			return err
 		}
 		s.peerClients[peerId] = client
+	}
+	return nil
+}
+
+// disconnect this server from peer identified by peerId.
+func (s *Server) DisconnectPeer(peerId int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.peerClients[peerId] != nil {
+		err := s.peerClients[peerId].Close()
+		s.peerClients[peerId] = nil
+		return err
 	}
 	return nil
 }

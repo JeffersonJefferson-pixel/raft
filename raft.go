@@ -62,12 +62,12 @@ type ConsensusModule struct {
 
 	// Volatile Raft state on all servers
 	commitIndex        int
-	lastApplied        int
+	lastApplied        int // different from commit index to decouple quick (RPC handling) and potentially slow operations (sending commands to clients).
 	state              CMState
 	electionResetEvent time.Time
 
-	// volate Raft state on leaders
-	nextIndex  map[int]int
+	// volatile Raft state on leaders
+	nextIndex  map[int]int // while only matchIndex is necessary, nextIndex help leader from having to replicate whole log.
 	matchIndex map[int]int
 }
 
@@ -111,6 +111,7 @@ func NewConsensusModule(id int, peerIds []int, server *Server, ready <-chan inte
 	cm.nextIndex = make(map[int]int)
 	cm.matchIndex = make(map[int]int)
 
+	// start election timer
 	go func() {
 		<-ready
 		cm.mu.Lock()
@@ -139,6 +140,7 @@ func (cm *ConsensusModule) runElectionTimer() {
 	for {
 		<-ticker.C
 		cm.mu.Lock()
+		// in case, the previous election was won.
 		if cm.state != Candidate && cm.state != Follower {
 			cm.dlog("in election timer state=%s, bailing out", cm.state)
 			cm.mu.Unlock()
@@ -202,22 +204,33 @@ func (cm *ConsensusModule) startElection() {
 					cm.becomeFollower(reply.Term)
 					return
 				} else if reply.Term == savedCurrentTerm {
-					votesReceived++
-					if votesReceived*2 > len(cm.peerIds)+1 {
-						// Won the election
-						cm.dlog("wins election with %d votes", votesReceived)
-						cm.startLeader()
-						return
+					if reply.VoteGranted {
+						votesReceived++
+						if votesReceived*2 > len(cm.peerIds)+1 {
+							// Won the election
+							cm.dlog("wins election with %d votes", votesReceived)
+							cm.startLeader()
+							return
+						}
 					}
 				}
 			}
 		}(peerId)
 	}
+
+	// run another election timer, in case this election is not successful.
+	go cm.runElectionTimer()
 }
 
 func (cm *ConsensusModule) startLeader() {
 	cm.state = Leader
-	cm.dlog("becomes Leader; term=%d, log=%v", cm.currentTerm, cm.log)
+
+	for _, peerId := range cm.peerIds {
+		cm.nextIndex[peerId] = len(cm.log)
+		cm.matchIndex[peerId] = -1
+	}
+
+	cm.dlog("becomes Leader; term=%d, nextIndex=%v, matchIndex%v; log=%v", cm.currentTerm, cm.nextIndex, cm.matchIndex, cm.log)
 
 	go func() {
 		ticker := time.NewTicker(50 * time.Millisecond)
@@ -229,6 +242,7 @@ func (cm *ConsensusModule) startLeader() {
 			<-ticker.C
 
 			cm.mu.Lock()
+			// stop sending heartbeat if no longer a leader.
 			if cm.state != Leader {
 				cm.mu.Unlock()
 				return
@@ -240,6 +254,11 @@ func (cm *ConsensusModule) startLeader() {
 
 func (cm *ConsensusModule) leaderSendHeartbeats() {
 	cm.mu.Lock()
+	// stop sending headerbeat if no longer leader.
+	if cm.state != Leader {
+		cm.mu.Unlock()
+		return
+	}
 	savedCurrentTerm := cm.currentTerm
 	cm.mu.Unlock()
 
@@ -252,6 +271,7 @@ func (cm *ConsensusModule) leaderSendHeartbeats() {
 			if prevLogIndex >= 0 {
 				prevLogTerm = cm.log[prevLogIndex].Term
 			}
+			// get entries based on next index of the peer
 			entries := cm.log[ni:]
 
 			// creaet append entries args
@@ -316,12 +336,19 @@ func (cm *ConsensusModule) leaderSendHeartbeats() {
 }
 
 func (cm *ConsensusModule) becomeFollower(term int) {
+	// a cm can become follower when
+	// - got a reply when starting election with larger term
+	// - got a reply when sending leader heartbeat with larger term
+	// - got a request vote rpc with larger term
+	// - got an append entries rpc with larger term
 	cm.dlog("becomes Follower with term=%d; log=%v", term, cm.log)
 	cm.state = Follower
 	cm.currentTerm = term
 	cm.votedFor = -1
+	// reset election event whenever cm becomes a follower.
 	cm.electionResetEvent = time.Now()
 
+	// start election timer every time cm becomes a follower.
 	go cm.runElectionTimer()
 }
 
@@ -425,6 +452,7 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 	return nil
 }
 
+// reports the cm'sid, current term and state.
 func (cm *ConsensusModule) Report() (id int, term int, isLeader bool) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
@@ -452,6 +480,7 @@ func (cm *ConsensusModule) Submit(command interface{}) bool {
 
 	cm.dlog("Submit received by %v: %v", cm.state, command)
 
+	// appends to log if cm is leader.
 	if cm.state == Leader {
 		cm.log = append(cm.log, LogEntry{Command: command, Term: cm.currentTerm})
 		cm.dlog("... log=%v", cm.log)
@@ -460,6 +489,7 @@ func (cm *ConsensusModule) Submit(command interface{}) bool {
 	return false
 }
 
+// watches newCommitReadyChan and send committed entries to commitChan.
 func (cm *ConsensusModule) commitChanSender() {
 	for range cm.newCommitReadyChan {
 		// find which entries we have to apply.
@@ -474,6 +504,7 @@ func (cm *ConsensusModule) commitChanSender() {
 		cm.mu.Unlock()
 		cm.dlog("commitChanSender entries=%v, savedLastApplied=%d", entries, savedLastApplied)
 
+		// send commmitted entries to commitChans.
 		for i, entry := range entries {
 			cm.commitChan <- CommitEntry{
 				Command: entry.Command,
