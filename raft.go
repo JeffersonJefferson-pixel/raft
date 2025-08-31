@@ -1,6 +1,8 @@
 package raft
 
 import (
+	"bytes"
+	"encoding/gob"
 	"fmt"
 	"log"
 	"math/rand"
@@ -46,6 +48,9 @@ type ConsensusModule struct {
 
 	// server containing this CM.
 	server *Server
+
+	// storage to persist state.
+	storage Storage
 
 	// channel where CM reports commited log entries.
 	commitChan chan<- CommitEntry
@@ -97,11 +102,12 @@ type AppendEntriesReply struct {
 	Success bool
 }
 
-func NewConsensusModule(id int, peerIds []int, server *Server, ready <-chan interface{}, commitChan chan<- CommitEntry) *ConsensusModule {
+func NewConsensusModule(id int, peerIds []int, server *Server, storage Storage, ready <-chan interface{}, commitChan chan<- CommitEntry) *ConsensusModule {
 	cm := new(ConsensusModule)
 	cm.id = id
 	cm.peerIds = peerIds
 	cm.server = server
+	cm.storage = storage
 	cm.commitChan = commitChan
 	cm.newCommitReadyChan = make(chan struct{}, 16)
 	cm.state = Follower
@@ -110,6 +116,11 @@ func NewConsensusModule(id int, peerIds []int, server *Server, ready <-chan inte
 	cm.lastApplied = -1
 	cm.nextIndex = make(map[int]int)
 	cm.matchIndex = make(map[int]int)
+
+	// recover persistent state if exists.
+	if cm.storage.HasData() {
+		cm.restoreFromStorage(cm.storage)
+	}
 
 	// start election timer
 	go func() {
@@ -387,6 +398,7 @@ func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteR
 		reply.VoteGranted = false
 	}
 	reply.Term = cm.currentTerm
+	cm.persistToStorage()
 	cm.dlog("... Request vote reply: %+v", reply)
 	return nil
 }
@@ -448,6 +460,7 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 	}
 
 	reply.Term = cm.currentTerm
+	cm.persistToStorage()
 	cm.dlog("AppendEntries reply: %+v", *reply)
 	return nil
 }
@@ -483,6 +496,7 @@ func (cm *ConsensusModule) Submit(command interface{}) bool {
 	// appends to log if cm is leader.
 	if cm.state == Leader {
 		cm.log = append(cm.log, LogEntry{Command: command, Term: cm.currentTerm})
+		cm.persistToStorage()
 		cm.dlog("... log=%v", cm.log)
 		return true
 	}
@@ -524,4 +538,57 @@ func (cm *ConsensusModule) lastLogIndexAndTerm() (int, int) {
 	} else {
 		return -1, -1
 	}
+}
+
+// get persistent state from storage and set to consensus module.
+func (cm *ConsensusModule) restoreFromStorage(storage Storage) {
+	// get curren term.
+	if termData, found := cm.storage.Get("currentTerm"); found {
+		d := gob.NewDecoder(bytes.NewBuffer(termData))
+		if err := d.Decode(&cm.currentTerm); err != nil {
+			log.Fatal(err)
+		}
+	} else {
+		log.Fatal("currentTerm not found in storage")
+	}
+	// get voted for.
+	if votedData, found := cm.storage.Get("votedFor"); found {
+		d := gob.NewDecoder(bytes.NewBuffer(votedData))
+		if err := d.Decode(&cm.votedFor); err != nil {
+			log.Fatal(err)
+		}
+	} else {
+		log.Fatal("votedFor not found in storage")
+	}
+	// get log.
+	if logData, found := cm.storage.Get("log"); found {
+		d := gob.NewDecoder(bytes.NewBuffer(logData))
+		if err := d.Decode(&cm.log); err != nil {
+			log.Fatal(err)
+		}
+	} else {
+		log.Fatal("log not found in storage")
+	}
+}
+
+// save persistent state to storage.
+func (cm *ConsensusModule) persistToStorage() {
+	// set term data.
+	var termData bytes.Buffer
+	if err := gob.NewEncoder(&termData).Encode(cm.currentTerm); err != nil {
+		log.Fatal(err)
+	}
+	cm.storage.Set("currentTerm", termData.Bytes())
+	// set voted for.
+	var votedData bytes.Buffer
+	if err := gob.NewEncoder(&votedData).Encode(cm.votedFor); err != nil {
+		log.Fatal(err)
+	}
+	cm.storage.Set("votedFor", votedData.Bytes())
+	// set log.
+	var logData bytes.Buffer
+	if err := gob.NewEncoder(&logData).Encode(cm.log); err != nil {
+		log.Fatal(err)
+	}
+	cm.storage.Set("log", logData.Bytes())
 }
