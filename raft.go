@@ -60,6 +60,8 @@ type ConsensusModule struct {
 	// on commitChan.
 	newCommitReadyChan chan struct{}
 
+	triggerAEChan chan struct{}
+
 	// Persistent Raft state
 	currentTerm int
 	votedFor    int
@@ -110,6 +112,7 @@ func NewConsensusModule(id int, peerIds []int, server *Server, storage Storage, 
 	cm.storage = storage
 	cm.commitChan = commitChan
 	cm.newCommitReadyChan = make(chan struct{}, 16)
+	cm.triggerAEChan = make(chan struct{}, 1)
 	cm.state = Follower
 	cm.votedFor = -1
 	cm.commitIndex = -1
@@ -119,7 +122,7 @@ func NewConsensusModule(id int, peerIds []int, server *Server, storage Storage, 
 
 	// recover persistent state if exists.
 	if cm.storage.HasData() {
-		cm.restoreFromStorage(cm.storage)
+		cm.restoreFromStorage()
 	}
 
 	// start election timer
@@ -241,29 +244,56 @@ func (cm *ConsensusModule) startLeader() {
 		cm.matchIndex[peerId] = -1
 	}
 
-	cm.dlog("becomes Leader; term=%d, nextIndex=%v, matchIndex%v; log=%v", cm.currentTerm, cm.nextIndex, cm.matchIndex, cm.log)
+	cm.dlog("becomes Leader; term=%d, nextIndex=%v, matchIndex=%v; log=%v", cm.currentTerm, cm.nextIndex, cm.matchIndex, cm.log)
 
-	go func() {
-		ticker := time.NewTicker(50 * time.Millisecond)
-		defer ticker.Stop()
+	// sends AEs to peers in the background based on trigger AE channel or every 50 ms.
+	go func(heartbeatTimeout time.Duration) {
+		cm.leaderSendAEs()
 
-		// Send periodic heartbeats, as long as still leader.
+		t := time.NewTimer(heartbeatTimeout)
+		defer t.Stop()
+
 		for {
-			cm.leaderSendHeartbeats()
-			<-ticker.C
+			doSend := false
 
-			cm.mu.Lock()
-			// stop sending heartbeat if no longer a leader.
-			if cm.state != Leader {
-				cm.mu.Unlock()
-				return
+			select {
+			// timer
+			case <-t.C:
+				doSend = true
+				// reset timer
+				t.Stop()
+				t.Reset(heartbeatTimeout)
+			// trigger AE channel
+			case _, ok := <-cm.triggerAEChan:
+				if ok {
+					doSend = true
+				} else {
+					return
+				}
+
+				// reset timer
+				if !t.Stop() {
+					<-t.C
+				}
+				t.Reset(heartbeatTimeout)
+
 			}
-			cm.mu.Unlock()
+
+			// send AEs if still leader
+			if doSend {
+				cm.mu.Lock()
+				if cm.state != Leader {
+					cm.mu.Unlock()
+					return
+				}
+				cm.mu.Unlock()
+				cm.leaderSendAEs()
+			}
 		}
-	}()
+	}(50 * time.Millisecond)
 }
 
-func (cm *ConsensusModule) leaderSendHeartbeats() {
+func (cm *ConsensusModule) leaderSendAEs() {
 	cm.mu.Lock()
 	// stop sending headerbeat if no longer leader.
 	if cm.state != Leader {
@@ -335,6 +365,7 @@ func (cm *ConsensusModule) leaderSendHeartbeats() {
 						if cm.commitIndex != savedCommitIndex {
 							cm.dlog("leader sets commitIndex := %d", cm.commitIndex)
 							cm.newCommitReadyChan <- struct{}{}
+							cm.triggerAEChan <- struct{}{}
 						}
 					} else {
 						cm.nextIndex[peerId] = ni - 1
@@ -487,20 +518,24 @@ func (cm *ConsensusModule) dlog(format string, args ...interface{}) {
 	}
 }
 
-func (cm *ConsensusModule) Submit(command interface{}) bool {
+func (cm *ConsensusModule) Submit(command any) int {
 	cm.mu.Lock()
-	defer cm.mu.Unlock()
-
 	cm.dlog("Submit received by %v: %v", cm.state, command)
 
 	// appends to log if cm is leader.
 	if cm.state == Leader {
+		submitIndex := len(cm.log)
 		cm.log = append(cm.log, LogEntry{Command: command, Term: cm.currentTerm})
+		// save new command to log
 		cm.persistToStorage()
 		cm.dlog("... log=%v", cm.log)
-		return true
+		cm.mu.Unlock()
+		// send to AE channel
+		cm.triggerAEChan <- struct{}{}
+		return submitIndex
 	}
-	return false
+	cm.mu.Unlock()
+	return -1
 }
 
 // watches newCommitReadyChan and send committed entries to commitChan.
@@ -541,7 +576,7 @@ func (cm *ConsensusModule) lastLogIndexAndTerm() (int, int) {
 }
 
 // get persistent state from storage and set to consensus module.
-func (cm *ConsensusModule) restoreFromStorage(storage Storage) {
+func (cm *ConsensusModule) restoreFromStorage() {
 	// get curren term.
 	if termData, found := cm.storage.Get("currentTerm"); found {
 		d := gob.NewDecoder(bytes.NewBuffer(termData))

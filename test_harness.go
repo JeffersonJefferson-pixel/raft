@@ -159,7 +159,7 @@ func (h *Harness) Shutdown() {
 	}
 }
 
-func (h *Harness) SubmitToServer(serverId int, cmd interface{}) bool {
+func (h *Harness) SubmitToServer(serverId int, cmd any) int {
 	return h.cluster[serverId].cm.Submit(cmd)
 }
 
