@@ -3,9 +3,12 @@ package raft
 import (
 	"fmt"
 	"log"
+	"math/rand"
 	"net"
 	"net/rpc"
+	"os"
 	"sync"
+	"time"
 )
 
 type Server struct {
@@ -151,9 +154,35 @@ type RPCProxy struct {
 }
 
 func (rpp *RPCProxy) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) error {
+	if len(os.Getenv("RAFT_UNRELIABLE_RPC")) > 0 {
+		dice := rand.Intn(10)
+		if dice == 9 {
+			rpp.cm.dlog("drop RequestVote")
+			return fmt.Errorf("RPC failed")
+		} else if dice == 8 {
+			rpp.cm.dlog("delay RequestVote")
+			time.Sleep(75 * time.Millisecond)
+		}
+	} else {
+		// normally 1 to 5 millisecond delay
+		time.Sleep(time.Duration(1+rand.Intn(5)) * time.Millisecond)
+	}
 	return rpp.cm.RequestVote(args, reply)
 }
 
 func (rpp *RPCProxy) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) error {
+	if len(os.Getenv("RAFT_UNRELIABLE_RPC")) > 0 {
+		dice := rand.Intn(10)
+		if dice == 9 {
+			rpp.cm.dlog("drop AppendEntries")
+			return fmt.Errorf("RPC failed")
+		} else if dice == 8 {
+			rpp.cm.dlog("delay AppendEntries")
+			time.Sleep(75 * time.Millisecond)
+		}
+	} else {
+		// normally 1 to 5 millisecond delay
+		time.Sleep(time.Duration(1+rand.Intn(5)) * time.Millisecond)
+	}
 	return rpp.cm.AppendEntries(args, reply)
 }
