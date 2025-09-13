@@ -102,6 +102,10 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
+
+	// for faster conflict resolution optimization
+	ConflictIndex int
+	ConflictTerm  int
 }
 
 func NewConsensusModule(id int, peerIds []int, server *Server, storage Storage, ready <-chan interface{}, commitChan chan<- CommitEntry) *ConsensusModule {
@@ -368,7 +372,24 @@ func (cm *ConsensusModule) leaderSendAEs() {
 							cm.triggerAEChan <- struct{}{}
 						}
 					} else {
-						cm.nextIndex[peerId] = ni - 1
+						// handle conflict index and term
+						if reply.ConflictTerm >= 0 {
+							// find last index of conflict term
+							lastIndexOfTerm := -1
+							for i := len(cm.log) - 1; i >= 0; i-- {
+								if cm.log[i].Term == reply.ConflictTerm {
+									lastIndexOfTerm = i
+									break
+								}
+							}
+							if lastIndexOfTerm >= 0 {
+								cm.nextIndex[peerId] = lastIndexOfTerm + 1
+							} else {
+								cm.nextIndex[peerId] = reply.ConflictIndex
+							}
+						} else {
+							cm.nextIndex[peerId] = reply.ConflictIndex
+						}
 						cm.dlog("AppendEntries reply from %d !success: nextIndex := %d", peerId, ni-1)
 					}
 				}
@@ -455,7 +476,7 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 		cm.electionResetEvent = time.Now()
 
 		// update logs in followers
-		if args.PrevLogIndex == -1 || (args.PrevLogIndex < len(cm.log) && args.PrevLogIndex == cm.log[args.PrevLogIndex].Term) {
+		if args.PrevLogIndex == -1 || (args.PrevLogIndex < len(cm.log) && args.PrevLogTerm == cm.log[args.PrevLogIndex].Term) {
 			reply.Success = true
 
 			// find insertion point
@@ -485,6 +506,26 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 				cm.commitIndex = min(args.LeaderCommit, len(cm.log)-1)
 				cm.dlog("... seting commitIndex=%d", cm.commitIndex)
 				cm.newCommitReadyChan <- struct{}{}
+			}
+		} else {
+			// no match for prev log index / term
+			// set conflict index and term in reply
+			if args.PrevLogIndex >= len(cm.log) {
+				// follower lag
+				reply.ConflictIndex = len(cm.log)
+				reply.ConflictTerm = -1
+			} else {
+				// term doesn't match
+				reply.ConflictTerm = cm.log[args.PrevLogIndex].Term
+
+				// find starting index of conflcting term
+				var i int
+				for i = args.PrevLogIndex - 1; i >= 0; i-- {
+					if cm.log[i].Term != reply.ConflictTerm {
+						break
+					}
+				}
+				reply.ConflictIndex = i + 1
 			}
 		}
 
