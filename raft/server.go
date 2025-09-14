@@ -27,12 +27,12 @@ type Server struct {
 	commitChan  chan<- CommitEntry
 	peerClients map[int]*rpc.Client
 
-	ready <-chan interface{}
-	quit  chan interface{}
+	ready <-chan any
+	quit  chan any
 	wg    sync.WaitGroup
 }
 
-func NewServer(serverId int, peerIds []int, storage Storage, ready <-chan interface{}, commitChan chan<- CommitEntry) *Server {
+func NewServer(serverId int, peerIds []int, storage Storage, ready <-chan any, commitChan chan<- CommitEntry) *Server {
 	s := new(Server)
 	s.serverId = serverId
 	s.peerIds = peerIds
@@ -40,7 +40,7 @@ func NewServer(serverId int, peerIds []int, storage Storage, ready <-chan interf
 	s.storage = storage
 	s.ready = ready
 	s.commitChan = commitChan
-	s.quit = make(chan interface{})
+	s.quit = make(chan any)
 	return s
 }
 
@@ -111,7 +111,7 @@ func (s *Server) DisconnectPeer(peerId int) error {
 	return nil
 }
 
-func (s *Server) Call(id int, serviceMethod string, args interface{}, reply interface{}) error {
+func (s *Server) Call(id int, serviceMethod string, args any, reply any) error {
 	s.mu.Lock()
 	peer := s.peerClients[id]
 	s.mu.Unlock()
@@ -127,6 +127,10 @@ func (s *Server) GetListenAddr() net.Addr {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.listener.Addr()
+}
+
+func (s *Server) Submit(cmd any) int {
+	return s.cm.Submit(cmd)
 }
 
 func (s *Server) DisconnectAll() {

@@ -16,7 +16,7 @@ const DebugCM = 1
 // data reported by Raft to commit channel.
 type CommitEntry struct {
 	// client command being commited.
-	Command interface{}
+	Command any
 	// log index at which client command is commited
 	Index int
 	// term at which client command is commited
@@ -24,7 +24,7 @@ type CommitEntry struct {
 }
 
 type LogEntry struct {
-	Command interface{}
+	Command any
 	Term    int
 }
 
@@ -108,7 +108,7 @@ type AppendEntriesReply struct {
 	ConflictTerm  int
 }
 
-func NewConsensusModule(id int, peerIds []int, server *Server, storage Storage, ready <-chan interface{}, commitChan chan<- CommitEntry) *ConsensusModule {
+func NewConsensusModule(id int, peerIds []int, server *Server, storage Storage, ready <-chan any, commitChan chan<- CommitEntry) *ConsensusModule {
 	cm := new(ConsensusModule)
 	cm.id = id
 	cm.peerIds = peerIds
@@ -552,7 +552,7 @@ func (cm *ConsensusModule) Stop() {
 }
 
 // logs a dubug message if DebugCM > 0.
-func (cm *ConsensusModule) dlog(format string, args ...interface{}) {
+func (cm *ConsensusModule) dlog(format string, args ...any) {
 	if DebugCM > 0 {
 		format = fmt.Sprintf("[%d] ", cm.id) + format
 		log.Printf(format, args...)
