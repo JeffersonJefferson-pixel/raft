@@ -1,12 +1,15 @@
 package kvservice
 
 import (
+	"context"
 	"encoding/gob"
 	"fmt"
 	"kv/api"
 	"log"
+	"net"
 	"net/http"
 	"sync"
+	"time"
 
 	"raft"
 )
@@ -146,7 +149,41 @@ func (kvs *KVService) handlePut(w http.ResponseWriter, req *http.Request) {
 }
 
 func (kvs *KVService) handleGet(w http.ResponseWriter, req *http.Request) {
+	gr := &api.GetRequest{}
+	if err := readRequestJSON(req, gr); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	kvs.kvlog("HTTP GET %v", gr)
 
+	cmd := Command{
+		Kind: CommandGet,
+		Key:  gr.Key,
+		Id:   kvs.id,
+	}
+
+	logIndex := kvs.rs.Submit(cmd)
+	if logIndex < 0 {
+		renderJSON(w, api.GetResponse{RespStatus: api.StatusNotLeader})
+		return
+	}
+
+	sub := kvs.createCommitSubscription(logIndex)
+
+	select {
+	case commitCmd := <-sub:
+		if commitCmd.Id == kvs.id {
+			renderJSON(w, api.GetResponse{
+				RespStatus: api.StatusOK,
+				KeyFound:   commitCmd.ResultFound,
+				Value:      commitCmd.ResultValue,
+			})
+		} else {
+			renderJSON(w, api.GetResponse{RespStatus: api.StatusFailedCommit})
+		}
+	case <-req.Context().Done():
+		return
+	}
 }
 
 func (kvs *KVService) handleCAS(w http.ResponseWriter, req *http.Request) {
@@ -180,4 +217,38 @@ func (kvs *KVService) kvlog(format string, args ...any) {
 		format = fmt.Sprintf("[kv %d] ", kvs.id) + format
 		log.Printf(format, args...)
 	}
+}
+
+func (kvs *KVService) ConnectToRaftPeer(peerId int, addr net.Addr) error {
+	return kvs.rs.ConnectToPeer(peerId, addr)
+}
+
+func (kvs *KVService) GetRaftListenAddr() net.Addr {
+	return kvs.rs.GetListenAddr()
+}
+
+func (kvs *KVService) IsLeader() bool {
+	return kvs.rs.IsLeader()
+}
+
+func (kvs *KVService) DisconnectFromAllRaftPeers() {
+	kvs.rs.DisconnectAll()
+}
+
+func (kvs *KVService) Shutdown() error {
+	kvs.kvlog("shutting down Raft server")
+	kvs.rs.Shutdown()
+	kvs.kvlog("closing commitChan")
+	close(kvs.commitChan)
+
+	if kvs.srv != nil {
+		kvs.kvlog("shutting down HTTP server")
+		ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+		defer cancel()
+		kvs.srv.Shutdown(ctx)
+		kvs.kvlog("HTP shutdown complete")
+		return nil
+	}
+
+	return nil
 }

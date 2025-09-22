@@ -190,3 +190,8 @@ func (rpp *RPCProxy) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesR
 	}
 	return rpp.cm.AppendEntries(args, reply)
 }
+
+func (s *Server) IsLeader() bool {
+	_, _, isLeader := s.cm.Report()
+	return isLeader
+}

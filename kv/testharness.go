@@ -1,0 +1,165 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"kv/kvclient"
+	"kv/kvservice"
+	"net/http"
+	"raft"
+	"testing"
+	"time"
+)
+
+type Harness struct {
+	n int
+
+	kvCluster []*kvservice.KVService
+
+	kvServiceAddrs []string
+
+	storage []*raft.MapStorage
+
+	t *testing.T
+
+	connected []bool
+
+	alive []bool
+
+	ctx context.Context
+
+	ctxCancel func()
+}
+
+func NewHarness(t *testing.T, n int) *Harness {
+	kvss := make([]*kvservice.KVService, n)
+	ready := make(chan any)
+	connected := make([]bool, n)
+	alive := make([]bool, n)
+	storage := make([]*raft.MapStorage, n)
+
+	// create kv services
+	for i := range n {
+		peerIds := make([]int, 0)
+		for p := range n {
+			if p != i {
+				peerIds = append(peerIds, p)
+			}
+		}
+
+		storage[i] = raft.NewMapStorage()
+		kvss[i] = kvservice.New(i, peerIds, storage[i], ready)
+		alive[i] = true
+	}
+
+	// connect peers
+	for i := range n {
+		for j := range n {
+			if i != j {
+				kvss[i].ConnectToRaftPeer(j, kvss[j].GetRaftListenAddr())
+			}
+		}
+		connected[i] = true
+	}
+	close(ready)
+
+	kvServiceAddrs := make([]string, n)
+	for i := range n {
+		port := 14200 + i
+		kvss[i].ServeHTTP(port)
+		kvServiceAddrs[i] = fmt.Sprintf("localhost:%d", port)
+	}
+
+	ctx, ctxCancel := context.WithCancel(context.Background())
+
+	h := &Harness{
+		n:              n,
+		kvCluster:      kvss,
+		kvServiceAddrs: kvServiceAddrs,
+		t:              t,
+		connected:      connected,
+		alive:          alive,
+		storage:        storage,
+		ctx:            ctx,
+		ctxCancel:      ctxCancel,
+	}
+
+	return h
+}
+
+func (h *Harness) NewClient() *kvclient.KVClient {
+	var addrs []string
+	for i := range h.n {
+		if h.alive[i] {
+			addrs = append(addrs, h.kvServiceAddrs[i])
+		}
+	}
+	return kvclient.New(addrs)
+}
+
+func (h *Harness) CheckSingleLeader() int {
+	for r := 0; r < 8; r++ {
+		leaderId := -1
+		for i := range h.n {
+			if h.connected[i] && h.kvCluster[i].IsLeader() {
+				if leaderId < 0 {
+					leaderId = i
+				} else {
+					h.t.Fatalf("both %d and %d think they're leaders", leaderId, i)
+				}
+			}
+			if leaderId >= 0 {
+				return leaderId
+			}
+			time.Sleep(150 * time.Millisecond)
+		}
+	}
+
+	h.t.Fatalf("leader not found")
+	return -1
+}
+
+func (h *Harness) CheckPut(c *kvclient.KVClient, key, value string) (string, bool) {
+	ctx, cancel := context.WithTimeout(h.ctx, 500*time.Millisecond)
+	defer cancel()
+	pv, f, err := c.Put(ctx, key, value)
+	if err != nil {
+		h.t.Error(err)
+	}
+	return pv, f
+}
+
+func (h *Harness) CheckGet(c *kvclient.KVClient, key string, wantValue string) {
+	ctx, cancel := context.WithTimeout(h.ctx, 500*time.Millisecond)
+	defer cancel()
+	gv, f, err := c.Get(ctx, key)
+	if err != nil {
+		h.t.Error(err)
+	}
+	if !f {
+		h.t.Errorf("got found=false, want true for key=%s", key)
+	}
+	if gv != wantValue {
+		h.t.Errorf("got value=%v, want %v", gv, wantValue)
+	}
+}
+
+func (h *Harness) Shutdown() {
+	for i := range h.n {
+		h.kvCluster[i].DisconnectFromAllRaftPeers()
+		h.connected[i] = false
+	}
+
+	http.DefaultClient.CloseIdleConnections()
+	h.ctxCancel()
+
+	for i := range h.n {
+		if h.alive[i] {
+			h.alive[i] = false
+			if err := h.kvCluster[i].Shutdown(); err != nil {
+				h.t.Errorf("error while shutting down service %d: %v", i, err)
+			}
+		}
+
+	}
+}

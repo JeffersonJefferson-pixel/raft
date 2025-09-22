@@ -1,10 +1,13 @@
 package kvclient
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"kv/api"
 	"log"
+	"net/http"
 	"sync/atomic"
 	"time"
 )
@@ -38,6 +41,15 @@ func (c *KVClient) Put(ctx context.Context, key string, value string) (string, b
 	var putResp api.PutResponse
 	err := c.send(ctx, "put", putReq, &putResp)
 	return putResp.PrevValue, putResp.KeyFound, err
+}
+
+func (c *KVClient) Get(ctx context.Context, key string) (string, bool, error) {
+	getReq := api.GetRequest{
+		Key: key,
+	}
+	var getResp api.GetResponse
+	err := c.send(ctx, "get", getReq, &getResp)
+	return getResp.Value, getResp.KeyFound, err
 }
 
 func (c *KVClient) send(ctx context.Context, route string, req any, resp api.Response) error {
@@ -93,6 +105,27 @@ func (c *KVClient) clientlog(format string, args ...any) {
 }
 
 func sendJSONRequest(ctx context.Context, path string, reqData any, respData any) error {
+	body := new(bytes.Buffer)
+	enc := json.NewEncoder(body)
+	if err := enc.Encode(reqData); err != nil {
+		return fmt.Errorf("JSON encoding request data: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, path, body)
+	if err != nil {
+		return fmt.Errorf("creating HTTP request: %w", err)
+	}
+	req.Header.Add("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+
+	dec := json.NewDecoder(resp.Body)
+	if err := dec.Decode(respData); err != nil {
+		return fmt.Errorf("JSON Decoding response data: %w", err)
+	}
 	return nil
 }
 
