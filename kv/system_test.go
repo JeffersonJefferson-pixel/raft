@@ -32,6 +32,21 @@ func TestCASBasic(t *testing.T) {
 	h.CheckGet(c1, "k", "newv")
 }
 
+func TestBasicAppend(t *testing.T) {
+	h := NewHarness(t, 3)
+	defer h.Shutdown()
+	h.CheckSingleLeader()
+
+	c1 := h.NewClient()
+	h.CheckPut(c1, "foo", "bar")
+
+	prev, found := h.CheckAppend(c1, "foo", "baz")
+	if !found || prev != "bar" {
+		t.Errorf("got found=%v, prev=%v, want true/foo", found, prev)
+	}
+	h.CheckGet(c1, "foo", "barbaz")
+}
+
 func sleepMs(n int) {
 	time.Sleep(time.Duration(n) * time.Millisecond)
 }

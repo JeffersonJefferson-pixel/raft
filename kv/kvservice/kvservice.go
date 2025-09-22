@@ -30,6 +30,9 @@ type KVService struct {
 	ds *DataStore
 
 	srv *http.Server
+
+	// It stores last request ID that was applied per client.
+	lastRequestIDPerClient map[int64]int64
 }
 
 func New(id int, peerIds []int, storage raft.Storage, readyChan <-chan any) *KVService {
@@ -40,11 +43,12 @@ func New(id int, peerIds []int, storage raft.Storage, readyChan <-chan any) *KVS
 	rs := raft.NewServer(id, peerIds, storage, readyChan, commitChan)
 	rs.Serve()
 	kvs := &KVService{
-		id:         id,
-		rs:         rs,
-		commitChan: commitChan,
-		ds:         NewDataStore(),
-		commitSubs: make(map[int]chan Command),
+		id:                     id,
+		rs:                     rs,
+		commitChan:             commitChan,
+		ds:                     NewDataStore(),
+		commitSubs:             make(map[int]chan Command),
+		lastRequestIDPerClient: make(map[int64]int64),
 	}
 
 	kvs.runUpdater()
@@ -57,16 +61,31 @@ func (kvs *KVService) runUpdater() {
 		for entry := range kvs.commitChan {
 			cmd := entry.Command.(Command)
 
-			// apply command to data store
-			switch cmd.Kind {
-			case CommandGet:
-				cmd.ResultValue, cmd.ResultFound = kvs.ds.Get(cmd.Key)
-			case CommandPut:
-				cmd.ResultValue, cmd.ResultFound = kvs.ds.Put(cmd.Key, cmd.Value)
-			case CommandCAS:
-				cmd.ResultValue, cmd.ResultFound = kvs.ds.CAS(cmd.Key, cmd.CompareValue, cmd.Value)
-			default:
-				panic(fmt.Errorf("unexpected command %v", cmd))
+			// handle duplicate
+			lastReqID, ok := kvs.lastRequestIDPerClient[cmd.ClientID]
+			if ok && lastReqID >= cmd.RequestID {
+				kvs.kvlog("duplicate request id%v, from client id=%v", cmd.RequestID, cmd.ClientID)
+
+				cmd = Command{
+					Kind:        cmd.Kind,
+					IsDuplicate: true,
+				}
+			} else {
+				kvs.lastRequestIDPerClient[cmd.ClientID] = cmd.RequestID
+
+				// apply command to data store
+				switch cmd.Kind {
+				case CommandGet:
+					cmd.ResultValue, cmd.ResultFound = kvs.ds.Get(cmd.Key)
+				case CommandPut:
+					cmd.ResultValue, cmd.ResultFound = kvs.ds.Put(cmd.Key, cmd.Value)
+				case CommandCAS:
+					cmd.ResultValue, cmd.ResultFound = kvs.ds.CAS(cmd.Key, cmd.CompareValue, cmd.Value)
+				case CommandAppend:
+					cmd.ResultValue, cmd.ResultFound = kvs.ds.Append(cmd.Key, cmd.Value)
+				default:
+					panic(fmt.Errorf("unexpected command %v", cmd))
+				}
 			}
 
 			// forward to subscriber of the command based on index
@@ -88,6 +107,7 @@ func (kvs *KVService) ServeHTTP(port int) {
 	mux.HandleFunc("POST /get/", kvs.handleGet)
 	mux.HandleFunc("POST /put/", kvs.handlePut)
 	mux.HandleFunc("POST /cas/", kvs.handleCAS)
+	mux.HandleFunc("POST /append/", kvs.handleAppend)
 
 	kvs.srv = &http.Server{
 		Addr:    fmt.Sprintf(":%d", port),
@@ -115,10 +135,12 @@ func (kvs *KVService) handlePut(w http.ResponseWriter, req *http.Request) {
 
 	// submit command to raft server
 	cmd := Command{
-		Kind:  CommandPut,
-		Key:   pr.Key,
-		Value: pr.Value,
-		Id:    kvs.id,
+		Kind:      CommandPut,
+		Key:       pr.Key,
+		Value:     pr.Value,
+		Id:        kvs.id,
+		ClientID:  pr.ClientID,
+		RequestID: pr.RequestID,
 	}
 	logIndex := kvs.rs.Submit(cmd)
 	if logIndex < 0 {
@@ -134,11 +156,18 @@ func (kvs *KVService) handlePut(w http.ResponseWriter, req *http.Request) {
 	case commitCmd := <-sub:
 		// check if command belong to kvs
 		if commitCmd.Id == kvs.id {
-			renderJSON(w, api.PutResponse{
-				RespStatus: api.StatusOK,
-				KeyFound:   commitCmd.ResultFound,
-				PrevValue:  commitCmd.ResultValue,
-			})
+			// handle duplicate
+			if commitCmd.IsDuplicate {
+				renderJSON(w, api.AppendResponse{
+					RespStatus: api.StatusDuplicateRequest,
+				})
+			} else {
+				renderJSON(w, api.PutResponse{
+					RespStatus: api.StatusOK,
+					KeyFound:   commitCmd.ResultFound,
+					PrevValue:  commitCmd.ResultValue,
+				})
+			}
 		} else {
 			renderJSON(w, api.PutResponse{RespStatus: api.StatusFailedCommit})
 		}
@@ -157,9 +186,11 @@ func (kvs *KVService) handleGet(w http.ResponseWriter, req *http.Request) {
 	kvs.kvlog("HTTP GET %v", gr)
 
 	cmd := Command{
-		Kind: CommandGet,
-		Key:  gr.Key,
-		Id:   kvs.id,
+		Kind:      CommandGet,
+		Key:       gr.Key,
+		Id:        kvs.id,
+		ClientID:  gr.ClientID,
+		RequestID: gr.RequestID,
 	}
 
 	logIndex := kvs.rs.Submit(cmd)
@@ -173,11 +204,18 @@ func (kvs *KVService) handleGet(w http.ResponseWriter, req *http.Request) {
 	select {
 	case commitCmd := <-sub:
 		if commitCmd.Id == kvs.id {
-			renderJSON(w, api.GetResponse{
-				RespStatus: api.StatusOK,
-				KeyFound:   commitCmd.ResultFound,
-				Value:      commitCmd.ResultValue,
-			})
+			// handle duplicate
+			if commitCmd.IsDuplicate {
+				renderJSON(w, api.AppendResponse{
+					RespStatus: api.StatusDuplicateRequest,
+				})
+			} else {
+				renderJSON(w, api.GetResponse{
+					RespStatus: api.StatusOK,
+					KeyFound:   commitCmd.ResultFound,
+					Value:      commitCmd.ResultValue,
+				})
+			}
 		} else {
 			renderJSON(w, api.GetResponse{RespStatus: api.StatusFailedCommit})
 		}
@@ -201,6 +239,9 @@ func (kvs *KVService) handleCAS(w http.ResponseWriter, req *http.Request) {
 		Value:        cr.Value,
 		CompareValue: cr.CompareValue,
 		Id:           kvs.id,
+
+		ClientID:  cr.ClientID,
+		RequestID: cr.RequestID,
 	}
 	logIndex := kvs.rs.Submit(cmd)
 	if logIndex < 0 {
@@ -215,11 +256,18 @@ func (kvs *KVService) handleCAS(w http.ResponseWriter, req *http.Request) {
 	select {
 	case commitCmd := <-sub:
 		if commitCmd.Id == kvs.id {
-			renderJSON(w, api.CASResponse{
-				RespStatus: api.StatusOK,
-				KeyFound:   commitCmd.ResultFound,
-				PrevValue:  commitCmd.ResultValue,
-			})
+			// handle duplicate
+			if commitCmd.IsDuplicate {
+				renderJSON(w, api.AppendResponse{
+					RespStatus: api.StatusDuplicateRequest,
+				})
+			} else {
+				renderJSON(w, api.CASResponse{
+					RespStatus: api.StatusOK,
+					KeyFound:   commitCmd.ResultFound,
+					PrevValue:  commitCmd.ResultValue,
+				})
+			}
 		} else {
 			renderJSON(w, api.CASResponse{
 				RespStatus: api.StatusFailedCommit,
@@ -229,6 +277,54 @@ func (kvs *KVService) handleCAS(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+}
+
+func (kvs *KVService) handleAppend(w http.ResponseWriter, req *http.Request) {
+	ar := &api.AppendRequest{}
+	if err := readRequestJSON(req, ar); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	kvs.kvlog("HTTP APPEND %v", ar)
+
+	// submit command
+	cmd := Command{
+		Kind:      CommandAppend,
+		Key:       ar.Key,
+		Value:     ar.Value,
+		ClientID:  ar.ClientID,
+		RequestID: ar.RequestID,
+	}
+	logIndex := kvs.rs.Submit(cmd)
+	if logIndex < 0 {
+		renderJSON(w, api.AppendResponse{
+			RespStatus: api.StatusNotLeader,
+		})
+	}
+
+	// create subscription
+	sub := kvs.createCommitSubscription(logIndex)
+
+	select {
+	case commitCmd := <-sub:
+		if commitCmd.Id == kvs.id {
+			if commitCmd.IsDuplicate {
+				renderJSON(w, api.AppendResponse{
+					RespStatus: api.StatusDuplicateRequest,
+				})
+			} else {
+				renderJSON(w, api.AppendResponse{
+					RespStatus: api.StatusOK,
+					KeyFound:   commitCmd.ResultFound,
+					PrevValue:  commitCmd.ResultValue,
+				})
+			}
+		} else {
+			renderJSON(w, api.AppendResponse{RespStatus: api.StatusFailedCommit})
+		}
+	case <-req.Context().Done():
+		return
+	}
 }
 
 func (kvs *KVService) createCommitSubscription(logIndex int) chan Command {

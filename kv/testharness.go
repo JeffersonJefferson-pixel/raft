@@ -129,6 +129,16 @@ func (h *Harness) CheckPut(c *kvclient.KVClient, key, value string) (string, boo
 	return pv, f
 }
 
+func (h *Harness) CheckAppend(c *kvclient.KVClient, key, value string) (string, bool) {
+	ctx, cancel := context.WithTimeout(h.ctx, 500*time.Millisecond)
+	defer cancel()
+	pv, f, err := c.Append(ctx, key, value)
+	if err != nil {
+		h.t.Error(err)
+	}
+	return pv, f
+}
+
 func (h *Harness) CheckGet(c *kvclient.KVClient, key string, wantValue string) {
 	ctx, cancel := context.WithTimeout(h.ctx, 500*time.Millisecond)
 	defer cancel()

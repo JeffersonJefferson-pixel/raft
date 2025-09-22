@@ -1,12 +1,15 @@
 package api
 
+type Response interface {
+	Status() ResponseStatus
+}
+
 type PutRequest struct {
 	Key   string
 	Value string
-}
 
-type Response interface {
-	Status() ResponseStatus
+	ClientID  int64
+	RequestID int64
 }
 
 type ResponseStatus int
@@ -23,6 +26,9 @@ func (pr *PutResponse) Status() ResponseStatus {
 
 type GetRequest struct {
 	Key string
+
+	ClientID  int64
+	RequestID int64
 }
 
 type GetResponse struct {
@@ -39,6 +45,9 @@ type CASRequest struct {
 	Key          string
 	CompareValue string
 	Value        string
+
+	ClientID  int64
+	RequestID int64
 }
 
 type CASResponse struct {
@@ -51,9 +60,28 @@ func (cr *CASResponse) Status() ResponseStatus {
 	return cr.RespStatus
 }
 
+type AppendRequest struct {
+	Key   string
+	Value string
+
+	ClientID  int64
+	RequestID int64
+}
+
+type AppendResponse struct {
+	RespStatus ResponseStatus
+	PrevValue  string
+	KeyFound   bool
+}
+
+func (ar *AppendResponse) Status() ResponseStatus {
+	return ar.RespStatus
+}
+
 const (
 	StatusInvalid ResponseStatus = iota
 	StatusOK
 	StatusNotLeader
 	StatusFailedCommit
+	StatusDuplicateRequest
 )

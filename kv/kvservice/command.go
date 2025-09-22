@@ -7,6 +7,7 @@ const (
 	CommandGet
 	CommandPut
 	CommandCAS
+	CommandAppend
 )
 
 type Command struct {
@@ -17,4 +18,8 @@ type Command struct {
 	ResultFound  bool
 
 	Id int
+
+	ClientID, RequestID int64
+
+	IsDuplicate bool
 }
