@@ -52,8 +52,20 @@ func (c *KVClient) Get(ctx context.Context, key string) (string, bool, error) {
 	return getResp.Value, getResp.KeyFound, err
 }
 
+func (c *KVClient) CAS(ctx context.Context, key, compare, value string) (string, bool, error) {
+	casReq := api.CASRequest{
+		Key:          key,
+		CompareValue: compare,
+		Value:        value,
+	}
+	var casResp api.CASResponse
+	err := c.send(ctx, "cas", casReq, &casResp)
+	return casResp.PrevValue, casResp.KeyFound, err
+}
+
 func (c *KVClient) send(ctx context.Context, route string, req any, resp api.Response) error {
 FindLeader:
+	// retry until got leader or timeout
 	for {
 		retryCtx, retryCtxCancel := context.WithTimeout(ctx, 50*time.Millisecond)
 		path := fmt.Sprintf("http://%s/%s/", c.addrs[c.assumedLeader], route)
@@ -105,6 +117,7 @@ func (c *KVClient) clientlog(format string, args ...any) {
 }
 
 func sendJSONRequest(ctx context.Context, path string, reqData any, respData any) error {
+	// encode request body
 	body := new(bytes.Buffer)
 	enc := json.NewEncoder(body)
 	if err := enc.Encode(reqData); err != nil {
@@ -117,11 +130,13 @@ func sendJSONRequest(ctx context.Context, path string, reqData any, respData any
 	}
 	req.Header.Add("Content-Type", "application/json")
 
+	// send request
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return err
 	}
 
+	// decode response
 	dec := json.NewDecoder(resp.Body)
 	if err := dec.Decode(respData); err != nil {
 		return fmt.Errorf("JSON Decoding response data: %w", err)

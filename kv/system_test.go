@@ -17,6 +17,21 @@ func TestBasicPutGetSingleClient(t *testing.T) {
 	sleepMs(80)
 }
 
+func TestCASBasic(t *testing.T) {
+	h := NewHarness(t, 3)
+	defer h.Shutdown()
+	h.CheckSingleLeader()
+
+	c1 := h.NewClient()
+	h.CheckPut(c1, "k", "v")
+
+	if pv, found := h.CheckCAS(c1, "k", "v", "newv"); pv != "v" || !found {
+		t.Errorf("got %s,%v, want replacement", pv, found)
+	}
+
+	h.CheckGet(c1, "k", "newv")
+}
+
 func sleepMs(n int) {
 	time.Sleep(time.Duration(n) * time.Millisecond)
 }

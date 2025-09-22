@@ -144,6 +144,16 @@ func (h *Harness) CheckGet(c *kvclient.KVClient, key string, wantValue string) {
 	}
 }
 
+func (h *Harness) CheckCAS(c *kvclient.KVClient, key, compare, value string) (string, bool) {
+	ctx, cancel := context.WithTimeout(h.ctx, 500*time.Millisecond)
+	defer cancel()
+	pv, f, err := c.CAS(ctx, key, compare, value)
+	if err != nil {
+		h.t.Error(err)
+	}
+	return pv, f
+}
+
 func (h *Harness) Shutdown() {
 	for i := range h.n {
 		h.kvCluster[i].DisconnectFromAllRaftPeers()

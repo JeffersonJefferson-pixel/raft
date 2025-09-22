@@ -187,6 +187,47 @@ func (kvs *KVService) handleGet(w http.ResponseWriter, req *http.Request) {
 }
 
 func (kvs *KVService) handleCAS(w http.ResponseWriter, req *http.Request) {
+	cr := &api.CASRequest{}
+	if err := readRequestJSON(req, cr); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	kvs.kvlog("HTTP CAS %v", cr)
+
+	// submit command to raft
+	cmd := Command{
+		Kind:         CommandCAS,
+		Key:          cr.Key,
+		Value:        cr.Value,
+		CompareValue: cr.CompareValue,
+		Id:           kvs.id,
+	}
+	logIndex := kvs.rs.Submit(cmd)
+	if logIndex < 0 {
+		renderJSON(w, api.CASResponse{RespStatus: api.StatusNotLeader})
+		return
+	}
+
+	// create subscription
+	sub := kvs.createCommitSubscription(logIndex)
+
+	// wait for command to be committed
+	select {
+	case commitCmd := <-sub:
+		if commitCmd.Id == kvs.id {
+			renderJSON(w, api.CASResponse{
+				RespStatus: api.StatusOK,
+				KeyFound:   commitCmd.ResultFound,
+				PrevValue:  commitCmd.ResultValue,
+			})
+		} else {
+			renderJSON(w, api.CASResponse{
+				RespStatus: api.StatusFailedCommit,
+			})
+		}
+	case <-req.Context().Done():
+		return
+	}
 
 }
 
